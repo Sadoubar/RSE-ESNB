@@ -1,0 +1,580 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import numpy as np
+import requests
+from datetime import datetime
+from io import BytesIO
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, PageBreak, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
+from reportlab.pdfgen import canvas
+import json
+
+# Configuration de la page
+st.set_page_config(
+    layout="wide",
+    page_title="Rapport RSE CEE P5",
+    page_icon="🌱",
+    initial_sidebar_state="expanded"
+)
+
+# Style CSS personnalisé
+st.markdown("""
+    <style>
+    .big-font { font-size:20px !important; font-weight: bold; color: #1e3d59; }
+    .medium-font { font-size:16px !important; color: #2e5266; }
+    .stMetric { background-color: #f8f9fa; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+    </style>
+""", unsafe_allow_html=True)
+
+# Palette
+COLOR_ENERGY = "#2a9d8f"  # économies d'énergie (GWh)
+COLOR_ENERGY_ACCENT = "#1f776b"
+COLOR_CO2 = "#e76f51"  # CO2 évité
+COLOR_CO2_ACCENT = "#c4563d"
+
+# =========================
+# CONSTANTES & HYPOTHÈSES
+# =========================
+FACTEUR_CUMAC_TO_KWH = {
+    'BAR-TH': 1 / 12.16,  # Résidentiel thermique
+    'BAR-EN': 1 / 17.29,  # Résidentiel enveloppe
+    'BAR-EQ': 1 / 11.12,  # Résidentiel équipement
+    'BAT-TH': 1 / 12.16,  # Tertiaire thermique
+    'BAT-EN': 1 / 17.29,  # Tertiaire enveloppe
+    'TRA': 1 / 4.47,  # Transport
+    'DEFAULT': 1 / 12.16
+}
+
+# Hypothèses pour la France
+EMISSION_CO2_KWH = 0.057
+CO2_PAR_VOITURE_AN = 2.8
+CO2_PAR_KM_VOITURE = 0.12
+COUT_MOYEN_ELECTRICITE_KWH = 0.2276
+
+CONSO_MOYENNE_FOYER_KWH = 4770 + 10542  # kWh/an (FR  chauffage élec +elec)
+COUT_GAZ_CHAUFFAGE_MIN = 0.1152
+COUT_GAZ_CHAUFFAGE_MAX = 0.1419
+COUT_GAZ_EAU_CHAUDE_MIN = 0.1492
+COUT_GAZ_EAU_CHAUDE_MAX = 0.1611
+CIRCONFERENCE_TERRE_KM = 40075
+TAUX_ACTUALISATION = 0.04
+TAUX_EFFICACITE_DEFAULT = 0.45
+
+VILLES_REFERENCE = {
+    10000: "Luxeuil-les-Bains (10k hab)",
+    25000: "Saintes (25k hab)",
+    32175:"Aix-les-Bains-Rhône (32k hab)",
+    50000: "Niort (50k hab)",
+    100000: "Nancy (100k hab)",
+    250000: "Montpellier (250k hab)",
+    500000: "Lyon (500k hab)",
+    1000000: "Marseille (1M hab)",
+    2000000: "Paris (2.2M hab)"
+}
+
+
+# =========================
+# UTILITAIRES
+# =========================
+def get_ville_equivalente(nb_habitants):
+    for seuil, ville in sorted(VILLES_REFERENCE.items()):
+        if nb_habitants <= seuil:
+            return ville
+    return VILLES_REFERENCE[2000000]
+
+
+def format_number(num, decimals=0):
+    if pd.isna(num):
+        return "N/A"
+    if decimals == 0:
+        return f"{int(round(num)):,}".replace(',', ' ')
+    return f"{num:,.{decimals}f}".replace(',', ' ')
+
+
+@st.cache_data
+def load_and_process_data(file, taux_efficacite):
+    try:
+        df = pd.read_excel(file, engine='openpyxl')
+        df.columns = df.columns.str.strip()
+
+        # Dates
+        date_cols = ['Date Validation', 'Date depot', 'Date de début', 'Date de fin', 'Date de la facture']
+        for col in date_cols:
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors='coerce')
+
+        # Code postal -> département
+        if 'code postal' in df.columns:
+            df['code postal'] = df['code postal'].astype(str).str.strip().str.zfill(5)
+            df['departement'] = df['code postal'].str[:2]
+
+        # Période
+        if 'PERIODE' in df.columns:
+            df['Période'] = df['PERIODE'].astype(str).str.strip().str.upper()
+        elif 'Depot' in df.columns:
+            df['Période'] = df['Depot'].astype(str).str.extract(r'(P\d)', expand=False).fillna('P5')
+        else:
+            df['Période'] = 'P5'
+
+        # Mandataire
+        if 'Mandataire' in df.columns:
+            df['Mandataire'] = df['Mandataire'].astype(str).str.strip()
+            df.loc[df['Mandataire'].isin(['nan', 'NaN']), 'Mandataire'] = 'Non renseigné'
+        else:
+            df['Mandataire'] = 'Non renseigné'
+
+        # Numériques primaires
+        for col in ['Total', 'Total précarité', 'Total classique', 'Tableau Recapitulatif champ 23']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+            else:
+                df[col] = 0
+
+        # Mapping Code équipement (MAJUSCULE)
+        if 'Code équipement' in df.columns:
+            code = df['Code équipement'].astype(str).str.strip().str.upper()
+            df['CodeEquip_prefix'] = code.str.split('-').str[0]
+            df['CodeEquip_sub'] = code.str.split('-').str[1].fillna('')
+
+            df['FacteurKey'] = np.where(
+                df['CodeEquip_sub'].isin(['TH', 'EN', 'EQ']),
+                df['CodeEquip_prefix'] + '-' + df['CodeEquip_sub'],
+                df['CodeEquip_prefix']  # ex: TRA, IND, AGRI…
+            )
+            df['Facteur_Conversion'] = df['FacteurKey'].map(FACTEUR_CUMAC_TO_KWH).fillna(
+                FACTEUR_CUMAC_TO_KWH['DEFAULT'])
+
+            df['Secteur'] = df['CodeEquip_prefix'].map({
+                'BAR': 'Bât. Résidentiel',
+                'BAT': 'Bât. Tertiaire',
+                'TRA': 'Transport',
+                'AGRI': 'Agriculture',
+                'IND': 'Industrie'
+            }).fillna('Autre')
+            df['Sous_Categorie'] = df['CodeEquip_sub'].replace('', 'N/A')
+        else:
+            df['Facteur_Conversion'] = FACTEUR_CUMAC_TO_KWH['DEFAULT']
+            df['Secteur'] = 'Autre'
+            df['Sous_Categorie'] = 'N/A'
+            df['CodeEquip_prefix'] = 'Autre'
+
+        # Type bénéficiaire
+        siren_col_8 = 'Tableau Recapitulatif champ 8'
+        siren_col_9 = 'Tableau Recapitulatif champ 9'
+        if siren_col_8 not in df.columns: df[siren_col_8] = ''
+        if siren_col_9 not in df.columns: df[siren_col_9] = ''
+        df[siren_col_8] = df[siren_col_8].astype(str).str.strip().replace('nan', '')
+        df[siren_col_9] = df[siren_col_9].astype(str).str.strip().replace('nan', '')
+
+        conditions = [
+            df['Total précarité'] > 0,
+            (df[siren_col_8] != '') | (df[siren_col_9] != '')
+        ]
+        choices = ['Précarité énergétique', 'Personne Morale']
+        df['Type_Beneficiaire'] = np.select(conditions, choices, default='Ménage Classique')
+
+        df['Statut'] = df['Date Validation'].apply(lambda x: 'Validé' if pd.notna(x) else 'En cours')
+        df['Annee_Depot'] = df['Date depot'].dt.year
+
+        # Calculs énergie / CO2 / €
+        df['kWh_cumac'] = pd.to_numeric(df.get('Total', 0), errors='coerce').fillna(0)
+        df['GWh_cumac'] = df['kWh_cumac'] / 1_000_000
+        df['kWh_reels_annuels'] = df['kWh_cumac'] * df['Facteur_Conversion'] * taux_efficacite
+        df['GWh_reels_annuels'] = df['kWh_reels_annuels'] / 1_000_000
+
+        df['CO2_evite_tonnes_an'] = (df['kWh_reels_annuels'] * EMISSION_CO2_KWH) / 1000
+        df['Nb_foyers_equivalents'] = df['kWh_reels_annuels'] / CONSO_MOYENNE_FOYER_KWH
+
+        df['Cout_energie_moyen'] = np.where(
+            df['Sous_Categorie'].eq('TH'),
+            (COUT_GAZ_CHAUFFAGE_MIN + COUT_GAZ_CHAUFFAGE_MAX) / 2,
+            COUT_MOYEN_ELECTRICITE_KWH
+        )
+        df['Economies_euros_an'] = df['kWh_reels_annuels'] * df['Cout_energie_moyen']
+        df['Prime_versee'] = df['Tableau Recapitulatif champ 23']
+
+        return df
+
+    except Exception as e:
+        st.error(f"Erreur lors du chargement du fichier : {str(e)}")
+        return None
+
+
+def build_pdf(df_view, kpis, hypotheses) -> bytes:
+    buffer = BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
+                            rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
+    styles = getSampleStyleSheet()
+    title = Paragraph("Rapport RSE – Activité CEE (vue filtrée)", styles['Title'])
+    elems = [title, Spacer(1, 12)]
+
+    # KPIs
+    kpi_style = ParagraphStyle('kpi', parent=styles['Heading3'], textColor=colors.HexColor("#1e3d59"))
+    for label, value in kpis:
+        elems.append(Paragraph(f"{label} : <b>{value}</b>", kpi_style))
+    elems.append(Spacer(1, 12))
+
+    # Hypothèses
+    elems.append(Paragraph("Hypothèses clés", styles['Heading3']))
+    hypo_tbl = Table([[k, str(v)] for k, v in hypotheses.items()], colWidths=[280, 420])
+    hypo_tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f1f3f5")),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+    ]))
+    elems.append(hypo_tbl)
+    elems.append(Spacer(1, 12))
+
+    # Tableau de synthèse
+    cols = ['Code équipement', 'Secteur', 'Sous_Categorie', 'kWh_cumac', 'kWh_reels_annuels',
+            'CO2_evite_tonnes_an', 'Economies_euros_an', 'Statut', 'Type_Beneficiaire', 'Annee_Depot']
+    cols = [c for c in cols if c in df_view.columns]
+    data = [cols] + df_view[cols].head(200).round(2).astype(str).values.tolist()
+    tbl = Table(data, repeatRows=1)
+    tbl.setStyle(TableStyle([
+        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#e9ecef")),
+        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+        ('FONTSIZE', (0, 0), (-1, -1), 8),
+        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
+        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
+    ]))
+    elems.append(tbl)
+
+    doc.build(elems)
+    buffer.seek(0)
+    return buffer.read()
+
+
+# =========================
+# UI
+# =========================
+st.title("🌱 RAPPORT RSE - ACTIVITÉ CEE")
+st.markdown("<p class='medium-font'>Tableau de bord de suivi et d'impact de la transition énergétique</p>",
+            unsafe_allow_html=True)
+
+# Sidebar Hypothèses
+st.sidebar.markdown("## 🌍 Hypothèses")
+taux_efficacite = st.sidebar.slider(
+    "Taux d'efficacité réelle des économies d'énergie (%)",
+    min_value=10, max_value=100, value=int(TAUX_EFFICACITE_DEFAULT * 100), step=5
+) / 100
+
+uploaded_file = st.file_uploader("📁 Charger votre fichier Excel CEE", type=['xlsx', 'xls'])
+
+if uploaded_file is not None:
+    with st.spinner('Traitement des données en cours...'):
+        df = load_and_process_data(uploaded_file, taux_efficacite)
+
+    if df is not None and not df.empty:
+        st.sidebar.markdown("## 🎯 Filtres")
+
+        # Filtres
+        periodes_disponibles = sorted(df['Période'].dropna().unique())
+        periode_filter = st.sidebar.multiselect("📅 Période", options=periodes_disponibles,
+                                                default=[
+                                                    'P5'] if 'P5' in periodes_disponibles else periodes_disponibles)
+
+        mandataires_disponibles = sorted(df['Mandataire'].dropna().unique())
+        mandataire_filter = st.sidebar.multiselect("🏢 Mandataire", options=mandataires_disponibles,
+                                                   default=mandataires_disponibles)
+
+        if 'Annee_Depot' in df.columns and not df['Annee_Depot'].isnull().all():
+            annees = sorted(df['Annee_Depot'].dropna().unique().astype(int))
+            annee_filter = st.sidebar.multiselect("📆 Année de dépôt", options=annees, default=annees)
+        else:
+            annee_filter = []
+
+        type_benef_filter = st.sidebar.multiselect("👥 Type de bénéficiaire",
+                                                   options=df['Type_Beneficiaire'].unique(),
+                                                   default=df['Type_Beneficiaire'].unique())
+
+        # Application des filtres
+        df_filtered = df.copy()
+        if periode_filter: df_filtered = df_filtered[df_filtered['Période'].isin(periode_filter)]
+        if mandataire_filter: df_filtered = df_filtered[df_filtered['Mandataire'].isin(mandataire_filter)]
+        if annee_filter: df_filtered = df_filtered[df_filtered['Annee_Depot'].isin(annee_filter)]
+        if type_benef_filter: df_filtered = df_filtered[df_filtered['Type_Beneficiaire'].isin(type_benef_filter)]
+
+        # KPIs
+        st.markdown("## 📊 Indicateurs Clés de Performance")
+        total_dossiers = len(df_filtered)
+        total_gwh_reels = df_filtered['GWh_reels_annuels'].sum()
+        total_foyers = df_filtered['Nb_foyers_equivalents'].sum()
+        total_primes = df_filtered['Prime_versee'].sum()
+        nb_operations_uniques = df_filtered[
+            'Code équipement'].nunique() if 'Code équipement' in df_filtered.columns else 0
+
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            st.metric("📋 Dossiers traités", format_number(total_dossiers), f"Période {', '.join(periode_filter)}")
+        with col2:
+            st.metric("⚡ Économies réelles/an", f"{format_number(total_gwh_reels, 1)} GWh",
+                      f"Efficacité {taux_efficacite * 100:.0f}%")
+        with col3:
+            st.metric("🏠 Foyers équivalents-- chauffage et elec", format_number(total_foyers),
+                      f"≈ {get_ville_equivalente(total_foyers * 2.2)}")
+        with col4:
+            st.metric("💰 Primes versées", f"{format_number(total_primes / 1_000_000, 1)} M€",
+                      f"{format_number(total_primes / total_dossiers if total_dossiers > 0 else 0)} €/dossier")
+        with col5:
+            st.metric("🔬 Opérations Uniques", format_number(nb_operations_uniques))
+
+        # TABS
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+            "🌍 Impact Environnemental", "👥 Impact Social", "🗺️ Impact Géographique",
+            "💼 Impact Économique", "📈 Analyses Détaillées", "📝 Hypothèses", "📄 Rapport PDF"
+        ])
+
+        # ---------- TAB 1 : IMPACT ENVIRONNEMENTAL ----------
+        with tab1:
+            st.markdown("### 🌱 Contribution à la Transition Écologique (par an)")
+            total_co2_evite = df_filtered['CO2_evite_tonnes_an'].sum()
+            tours_terre = (total_co2_evite * 1000) / (CIRCONFERENCE_TERRE_KM * CO2_PAR_KM_VOITURE)
+            arbres_equivalent = (total_co2_evite * 1000) / 25
+            voitures_retirees = total_co2_evite / CO2_PAR_VOITURE_AN
+
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("🌡️ CO₂ évité/an", f"{format_number(total_co2_evite)} tonnes",
+                          f"≈ {format_number(voitures_retirees)} voitures retirées")
+            with c2:
+                st.metric("🚗 Tours de la Terre", f"{format_number(tours_terre, 1)} tours/an", "en voiture économisés")
+            with c3:
+                st.metric("🌳 Arbres équivalents", format_number(arbres_equivalent), "arbres plantés")
+
+            # Groupes annuels
+            if 'Annee_Depot' in df_filtered.columns and not df_filtered['Annee_Depot'].dropna().empty:
+                g = df_filtered.groupby('Annee_Depot').agg(
+                    GWh=('GWh_reels_annuels', 'sum'),
+                    CO2=('CO2_evite_tonnes_an', 'sum')
+                ).reset_index().sort_values('Annee_Depot')
+
+                # Cumul
+                g['GWh_cumul'] = g['GWh'].cumsum()
+                g['CO2_cumul'] = g['CO2'].cumsum()
+
+                st.markdown("### ⚡ Évolution (4 cadrans séparés)")
+                colA, colB = st.columns(2)
+                with colA:
+                    fig_energy_year = go.Figure(
+                        go.Bar(x=g['Annee_Depot'], y=g['GWh'], marker_color=COLOR_ENERGY, name="Énergie (GWh/an)"))
+                    fig_energy_year.update_layout(title="ÉNERGIE — Annuel (GWh/an)", xaxis_title="Année",
+                                                  yaxis_title="GWh/an", height=380, showlegend=False)
+                    st.plotly_chart(fig_energy_year, use_container_width=True)
+                with colB:
+                    fig_co2_year = go.Figure(
+                        go.Bar(x=g['Annee_Depot'], y=g['CO2'], marker_color=COLOR_CO2, name="CO₂ évité (t/an)"))
+                    fig_co2_year.update_layout(title="CO₂ — Annuel (t/an)", xaxis_title="Année", yaxis_title="t/an",
+                                               height=380, showlegend=False)
+                    st.plotly_chart(fig_co2_year, use_container_width=True)
+                colC, colD = st.columns(2)
+                with colC:
+                    fig_energy_cum = go.Figure(go.Scatter(x=g['Annee_Depot'], y=g['GWh_cumul'], mode='lines+markers',
+                                                          line=dict(color=COLOR_ENERGY_ACCENT, width=3),
+                                                          name="Énergie cumulée (GWh)"))
+                    fig_energy_cum.update_layout(title="ÉNERGIE — Cumul (GWh)", xaxis_title="Année",
+                                                 yaxis_title="GWh cumulés", height=380, showlegend=False)
+                    st.plotly_chart(fig_energy_cum, use_container_width=True)
+                with colD:
+                    fig_co2_cum = go.Figure(go.Scatter(x=g['Annee_Depot'], y=g['CO2_cumul'], mode='lines+markers',
+                                                       line=dict(color=COLOR_CO2_ACCENT, width=3, dash='dot'),
+                                                       name="CO₂ cumulé (t)"))
+                    fig_co2_cum.update_layout(title="CO₂ — Cumul (t)", xaxis_title="Année", yaxis_title="t cumulées",
+                                              height=380, showlegend=False)
+                    st.plotly_chart(fig_co2_cum, use_container_width=True)
+
+        # ---------- TAB 2 : IMPACT SOCIAL ----------
+        with tab2:
+            st.markdown("### 🫂 Soutien aux Bénéficiaires")
+            df_plot = df_filtered.copy()
+            df_plot['Secteur'] = df_plot['Secteur'].fillna('Autre')
+            df_plot['Type_Beneficiaire'] = df_plot['Type_Beneficiaire'].fillna('Non renseigné')
+
+            benef_volume = df_plot.groupby('Type_Beneficiaire')['GWh_cumac'].sum()
+            benef_counts = df_plot['Type_Beneficiaire'].value_counts()
+
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("#### Volume CEE par type de bénéficiaire")
+                fig_benef_pie = px.pie(names=benef_volume.index, values=benef_volume.values,
+                                       title="Répartition du volume CEE (GWhc)")
+                st.plotly_chart(fig_benef_pie, use_container_width=True)
+            with c2:
+                st.markdown("#### Nombre de dossiers par type de bénéficiaire")
+                st.metric("🤝 Ménages en précarité", format_number(benef_counts.get('Précarité énergétique', 0)))
+                st.metric("👤 Ménages Classiques", format_number(benef_counts.get('Ménage Classique', 0)))
+                st.metric("🏢 Personnes Morales", format_number(benef_counts.get('Personne Morale', 0)))
+
+            st.markdown("---")
+            st.markdown("#### Répartition par secteur d'activité")
+            sector_volume = df_plot.groupby('Secteur')['GWh_cumac'].sum()
+            fig_sector_pie = px.pie(names=sector_volume.index, values=sector_volume.values,
+                                    title="Répartition du volume CEE par secteur", hole=0.4)
+            st.plotly_chart(fig_sector_pie, use_container_width=True)
+
+            st.markdown("---")
+            st.markdown("#### Évolution annuelle de la répartition (%)")
+            if 'Annee_Depot' in df_filtered.columns and not df_filtered['Annee_Depot'].dropna().empty:
+                # Évolution par type de bénéficiaire
+                evolution_benef = df_filtered.groupby(['Annee_Depot', 'Type_Beneficiaire'])['GWh_cumac'].sum().unstack(
+                    fill_value=0).apply(lambda x: 100 * x / x.sum(), axis=1).reset_index()
+                evolution_benef = evolution_benef.melt(id_vars='Annee_Depot', var_name='Type_Beneficiaire',
+                                                       value_name='Percentage')
+
+                # Évolution par secteur
+                evolution_sector = df_filtered.groupby(['Annee_Depot', 'Secteur'])['GWh_cumac'].sum().unstack(
+                    fill_value=0).apply(lambda x: 100 * x / x.sum(), axis=1).reset_index()
+                evolution_sector = evolution_sector.melt(id_vars='Annee_Depot', var_name='Secteur',
+                                                         value_name='Percentage')
+
+                col_evo1, col_evo2 = st.columns(2)
+                with col_evo1:
+                    fig_evol_benef = px.area(
+                        evolution_benef, x='Annee_Depot', y='Percentage', color='Type_Beneficiaire',
+                        title="Évolution de la part du volume par bénéficiaire (%)",
+                        labels={'Percentage': '% du Volume (GWhc)', 'Annee_Depot': 'Année'}
+                    )
+                    st.plotly_chart(fig_evol_benef, use_container_width=True)
+                with col_evo2:
+                    fig_evol_sector = px.area(
+                        evolution_sector, x='Annee_Depot', y='Percentage', color='Secteur',
+                        title="Évolution de la part du volume par secteur (%)",
+                        labels={'Percentage': '% du Volume (GWhc)', 'Annee_Depot': 'Année'}
+                    )
+                    st.plotly_chart(fig_evol_sector, use_container_width=True)
+
+        # ---------- TAB 3 : CARTE GÉOGRAPHIQUE ----------
+        with tab3:
+            st.markdown("### 🗺️ Impact Géographique (Sélection de métrique)")
+            metric_choice = st.selectbox("Métrique à cartographier", [
+                "Économies d'énergie (GWh réels/an)",
+                "CO₂ évité (tonnes/an)"
+            ], index=0)
+
+            if 'departement' in df_filtered.columns:
+                if metric_choice.startswith("Économies"):
+                    map_df = df_filtered.groupby('departement')['GWh_reels_annuels'].sum().reset_index()
+                    color_col = 'GWh_reels_annuels'
+                    color_title = "GWh réels/an"
+                    color_scale = "Viridis"
+                else:
+                    map_df = df_filtered.groupby('departement')['CO2_evite_tonnes_an'].sum().reset_index()
+                    color_col = 'CO2_evite_tonnes_an'
+                    color_title = "Tonnes CO₂ évitées/an"
+                    color_scale = "Turbo"
+
+                fig_map = px.choropleth(
+                    map_df,
+                    geojson="https://raw.githubusercontent.com/gregoiredavid/france-geojson/master/departements.geojson",
+                    locations='departement',
+                    featureidkey="properties.code",
+                    color=color_col,
+                    color_continuous_scale=color_scale,
+                    scope="europe",
+                    title=f"Impact par département ({color_title})",
+                    hover_data={'departement': True, color_col: ':.3f'}
+                )
+                fig_map.update_geos(fitbounds="locations", visible=False)
+                fig_map.update_traces(marker_line_width=0.6, marker_line_color="white")
+                fig_map.update_layout(height=620, coloraxis_colorbar_title=color_title)
+                st.plotly_chart(fig_map, use_container_width=True)
+            else:
+                st.info("Aucun code postal / département détecté dans vos données.")
+
+        # ---------- TAB 4 : ECONOMIQUE ----------
+        with tab4:
+            st.markdown("### 💰 Valorisation Économique")
+            if 'Annee_Depot' in df_filtered.columns and not df_filtered['Annee_Depot'].dropna().empty:
+                primes_yearly = df_filtered.groupby('Annee_Depot')['Prime_versee'].sum().reset_index()
+                fig_primes = px.bar(primes_yearly, x='Annee_Depot', y='Prime_versee',
+                                    title="Évolution annuelle des primes versées", color='Prime_versee')
+                st.plotly_chart(fig_primes, use_container_width=True)
+
+        # ---------- TAB 5 : ANALYSES DÉTAILLÉES ----------
+        with tab5:
+            st.markdown("### 🔬 Analyses Détaillées par Opération")
+            if 'Code équipement' in df_filtered.columns:
+                agg = df_filtered.groupby('Code équipement').agg(
+                    GWh_cumac=('GWh_cumac', 'sum'),
+                    Nb_Dossiers=('GWh_cumac', 'size'),
+                    GWh_reels_annuels=('GWh_reels_annuels', 'sum'),
+                    CO2_evite_tonnes_an=('CO2_evite_tonnes_an', 'sum')
+                ).reset_index()
+                indicateur = st.radio("Indicateur pour le classement et le graphique",
+                                      ["Nombre de dossiers", "GWh cumac", "GWh réels/an", "CO₂ évité (t/an)"],
+                                      horizontal=True)
+
+                if indicateur == "Nombre de dossiers":
+                    value_col, title_bar, color_bar = 'Nb_Dossiers', "Top opérations – Nombre de dossiers", "#fca311"
+                elif indicateur == "GWh cumac":
+                    value_col, title_bar, color_bar = 'GWh_cumac', "Top opérations – Volume GWh cumac", "#4c78a8"
+                elif indicateur == "GWh réels/an":
+                    value_col, title_bar, color_bar = 'GWh_reels_annuels', "Top opérations – GWh réels/an", COLOR_ENERGY
+                else:  # CO2
+                    value_col, title_bar, color_bar = 'CO2_evite_tonnes_an', "Top opérations – CO₂ évité (t/an)", COLOR_CO2
+
+                top = agg.nlargest(10, value_col).sort_values(value_col)
+                fig_ops_bar = go.Figure(
+                    go.Bar(x=top[value_col], y=top['Code équipement'], orientation='h', marker_color=color_bar))
+                fig_ops_bar.update_layout(title=title_bar, xaxis_title=indicateur, yaxis_title="Code équipement",
+                                          height=520, margin=dict(l=120, r=40, t=60, b=40))
+                st.plotly_chart(fig_ops_bar, use_container_width=True)
+
+                st.markdown("---")
+                st.markdown(f"#### Évolution annuelle par {indicateur} (Top 10 opérations)")
+                top_10_codes = agg.nlargest(10, value_col)['Code équipement'].tolist()
+                df_top_ops = df_filtered[df_filtered['Code équipement'].isin(top_10_codes)]
+
+                if value_col == 'Nb_Dossiers':
+                    evolution_ops = df_top_ops.groupby(['Annee_Depot', 'Code équipement']).size().reset_index(
+                        name=value_col)
+                else:
+                    evolution_ops = df_top_ops.groupby(['Annee_Depot', 'Code équipement'])[
+                        value_col].sum().reset_index()
+
+                fig_evol_ops = px.bar(
+                    evolution_ops, x='Annee_Depot', y=value_col, color='Code équipement',
+                    title=f"Évolution annuelle par {indicateur} (Top 10 opérations)",
+                    labels={value_col: indicateur, 'Annee_Depot': 'Année'},
+                    barmode='stack'
+                )
+                st.plotly_chart(fig_evol_ops, use_container_width=True)
+
+        # ---------- TAB 6 : HYPOTHÈSES ----------
+        with tab6:
+            st.markdown("### 📝 Hypothèses de Travail")
+            st.json({
+                "Périmètre": "France",
+                "Hypothèses d'équivalence": {
+                    "Voitures retirées": f"Basé sur {CO2_PAR_VOITURE_AN} tCO2/an/voiture.",
+                    "Tours de la Terre": f"Basé sur {CO2_PAR_KM_VOITURE} kgCO2/km et une circonférence de {CIRCONFERENCE_TERRE_KM} km.",
+                    "Arbres équivalents": "Basé sur 25 kgCO2/an/arbre (valeur indicative)."
+                },
+                "Facteurs de Conversion (Cumac -> kWh/an)": {k: round(v, 4) for k, v in FACTEUR_CUMAC_TO_KWH.items()},
+                "Constantes d'Impact": {
+                    "Consommation moyenne d'un foyer (kWh/an)": CONSO_MOYENNE_FOYER_KWH,
+                    "Émissions CO2 (kg/kWh)": EMISSION_CO2_KWH,
+                    "Coût de l'électricité (€/kWh)": COUT_MOYEN_ELECTRICITE_KWH
+                }
+            })
+
+        # ---------- TAB 7 : PDF ----------
+        with tab7:
+            st.markdown("### 📄 Télécharger le Rapport PDF")
+            st.info("Le PDF reprend les filtres, les KPIs et un extrait (200 lignes) de la vue.")
+            st.download_button(label="Télécharger le PDF", data="PDF non disponible dans cette démo",
+                               file_name=f"Rapport_RSE_CEE.pdf", mime="application/pdf")
+
+    else:
+        st.warning("Le fichier a été chargé mais ne contient aucune ligne exploitable.")
+else:
+    st.info("👋 Bienvenue ! Veuillez charger votre fichier de données pour commencer l'analyse.")
+
