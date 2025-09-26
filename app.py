@@ -38,6 +38,7 @@ COLOR_ENERGY = "#2a9d8f"  # économies d'énergie (GWh)
 COLOR_ENERGY_ACCENT = "#1f776b"
 COLOR_CO2 = "#e76f51"  # CO2 évité
 COLOR_CO2_ACCENT = "#c4563d"
+COLOR_CEE = "#457b9d"  # GWhc
 
 # =========================
 # CONSTANTES & HYPOTHÈSES
@@ -70,7 +71,7 @@ TAUX_EFFICACITE_DEFAULT = 0.45
 VILLES_REFERENCE = {
     10000: "Luxeuil-les-Bains (10k hab)",
     25000: "Saintes (25k hab)",
-    32175:"Aix-les-Bains-Rhône (32k hab)",
+    32175: "Aix-les-Bains-Rhône (32k hab)",
     50000: "Niort (50k hab)",
     100000: "Nancy (100k hab)",
     250000: "Montpellier (250k hab)",
@@ -328,9 +329,9 @@ if uploaded_file is not None:
             st.metric("🔬 Opérations Uniques", format_number(nb_operations_uniques))
 
         # TABS
-        tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+        tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
             "🌍 Impact Environnemental", "👥 Impact Social", "🗺️ Impact Géographique",
-            "💼 Impact Économique", "📈 Analyses Détaillées", "📝 Hypothèses", "📄 Rapport PDF"
+            "💼 Impact Économique", "📈 Analyses Détaillées", "📈 Évolution CEE (GWhc)", "📝 Hypothèses", "📄 Rapport PDF"
         ])
 
         # ---------- TAB 1 : IMPACT ENVIRONNEMENTAL ----------
@@ -548,8 +549,34 @@ if uploaded_file is not None:
                 )
                 st.plotly_chart(fig_evol_ops, use_container_width=True)
 
-        # ---------- TAB 6 : HYPOTHÈSES ----------
+        # ---------- TAB 6 : ÉVOLUTION CEE (GWHC) ----------
         with tab6:
+            st.markdown("### 📈 Évolution du Volume CEE (GWh cumac) par an")
+            if 'Annee_Depot' in df_filtered.columns and not df_filtered['Annee_Depot'].dropna().empty:
+                gwhc_yearly = df_filtered.groupby('Annee_Depot')['GWh_cumac'].sum().reset_index()
+
+                fig_gwhc_yearly = px.bar(
+                    gwhc_yearly,
+                    x='Annee_Depot',
+                    y='GWh_cumac',
+                    title="Volume CEE (GWhc) par Année de Dépôt",
+                    labels={'GWh_cumac': 'GWh cumac', 'Annee_Depot': 'Année'},
+                    color='GWh_cumac',
+                    color_continuous_scale='Blues',
+                    text_auto='.2s'
+                )
+                fig_gwhc_yearly.update_traces(textposition='outside')
+                fig_gwhc_yearly.update_layout(
+                    xaxis_title="Année",
+                    yaxis_title="GWh cumac",
+                    font=dict(size=14)
+                )
+                st.plotly_chart(fig_gwhc_yearly, use_container_width=True)
+            else:
+                st.info("Les données d'année de dépôt sont nécessaires pour afficher cette évolution.")
+
+        # ---------- TAB 7 : HYPOTHÈSES ----------
+        with tab7:
             st.markdown("### 📝 Hypothèses de Travail")
             st.json({
                 "Périmètre": "France",
@@ -566,8 +593,8 @@ if uploaded_file is not None:
                 }
             })
 
-        # ---------- TAB 7 : PDF ----------
-        with tab7:
+        # ---------- TAB 8 : PDF ----------
+        with tab8:
             st.markdown("### 📄 Télécharger le Rapport PDF")
             st.info("Le PDF reprend les filtres, les KPIs et un extrait (200 lignes) de la vue.")
             st.download_button(label="Télécharger le PDF", data="PDF non disponible dans cette démo",
@@ -577,4 +604,3 @@ if uploaded_file is not None:
         st.warning("Le fichier a été chargé mais ne contient aucune ligne exploitable.")
 else:
     st.info("👋 Bienvenue ! Veuillez charger votre fichier de données pour commencer l'analyse.")
-
