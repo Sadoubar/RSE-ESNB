@@ -39,31 +39,46 @@ COLOR_ENERGY_ACCENT = "#1f776b"
 COLOR_CO2 = "#e76f51"  # CO2 évité
 COLOR_CO2_ACCENT = "#c4563d"
 COLOR_CEE = "#457b9d"  # GWhc
+COLOR_ECONOMY = "#f4a261"  # Couleur pour l'économie
+COLOR_ECONOMY_ACCENT = "#e5934a"
+COLOR_PRIME = "#457b9d"
+COLOR_PRIME_ACCENT = "#3a698a"
 
 # =========================
 # CONSTANTES & HYPOTHÈSES
 # =========================
 FACTEUR_CUMAC_TO_KWH = {
-    'BAR-TH': 1 / 12.16,  # Résidentiel thermique
-    'BAR-EN': 1 / 17.29,  # Résidentiel enveloppe
-    'BAR-EQ': 1 / 11.12,  # Résidentiel équipement
-    'BAT-TH': 1 / 12.16,  # Tertiaire thermique
-    'BAT-EN': 1 / 17.29,  # Tertiaire enveloppe
-    'TRA': 1 / 4.47,  # Transport
-    'DEFAULT': 1 / 12.16
+    'BAR-TH': 1 / 12.16,
+    'BAR-EN': 1 / 17.29,
+    'BAR-EQ': 1 / 11.12,
+    'BAT-TH': 1 / 12.16,
+    'AGRI-TH': 1 / 12.16,
+    'BAT-EN': 1 / 17.29,
+    'TRA': 1 / 0.9615,  # Modifié pour une durée de vie de 1 an
+    'DEFAULT': 1 / 8.11
+}
+
+DUREE_VIE_EQUIPEMENT = {
+    'BAR-TH': 17,
+    'AGRI-TH': 17,
+    'BAR-EN': 30,
+    'BAR-EQ': 15,
+    'BAT-TH': 17,
+    'BAT-EN': 30,
+    'TRA': 1,  # Modifié de 7 à 1 an
+    'DEFAULT': 10
 }
 
 # Hypothèses pour la France
 EMISSION_CO2_KWH = 0.057
 CO2_PAR_VOITURE_AN = 2.8
 CO2_PAR_KM_VOITURE = 0.12
-COUT_MOYEN_ELECTRICITE_KWH = 0.2276
 
-CONSO_MOYENNE_FOYER_KWH = 4770 + 10542  # kWh/an (FR  chauffage élec +elec)
-COUT_GAZ_CHAUFFAGE_MIN = 0.1152
-COUT_GAZ_CHAUFFAGE_MAX = 0.1419
-COUT_GAZ_EAU_CHAUDE_MIN = 0.1492
-COUT_GAZ_EAU_CHAUDE_MAX = 0.1611
+# Nouveaux coûts simplifiés
+COUT_ELECTRICITE_KWH = 0.22  # Gardé pour référence si besoin
+COUT_CHAUFFAGE_KWH = 0.10
+
+CONSO_MOYENNE_FOYER_KWH = 15312  # kWh/an (FR  chauffage élec +elec)
 CIRCONFERENCE_TERRE_KM = 40075
 TAUX_ACTUALISATION = 0.04
 TAUX_EFFICACITE_DEFAULT = 0.45
@@ -152,6 +167,8 @@ def load_and_process_data(file, taux_efficacite):
             df['Facteur_Conversion'] = df['FacteurKey'].map(FACTEUR_CUMAC_TO_KWH).fillna(
                 FACTEUR_CUMAC_TO_KWH['DEFAULT'])
 
+            df['Duree_Vie'] = df['FacteurKey'].map(DUREE_VIE_EQUIPEMENT).fillna(DUREE_VIE_EQUIPEMENT['DEFAULT'])
+
             df['Secteur'] = df['CodeEquip_prefix'].map({
                 'BAR': 'Bât. Résidentiel',
                 'BAT': 'Bât. Tertiaire',
@@ -162,6 +179,7 @@ def load_and_process_data(file, taux_efficacite):
             df['Sous_Categorie'] = df['CodeEquip_sub'].replace('', 'N/A')
         else:
             df['Facteur_Conversion'] = FACTEUR_CUMAC_TO_KWH['DEFAULT']
+            df['Duree_Vie'] = DUREE_VIE_EQUIPEMENT['DEFAULT']
             df['Secteur'] = 'Autre'
             df['Sous_Categorie'] = 'N/A'
             df['CodeEquip_prefix'] = 'Autre'
@@ -193,12 +211,8 @@ def load_and_process_data(file, taux_efficacite):
         df['CO2_evite_tonnes_an'] = (df['kWh_reels_annuels'] * EMISSION_CO2_KWH) / 1000
         df['Nb_foyers_equivalents'] = df['kWh_reels_annuels'] / CONSO_MOYENNE_FOYER_KWH
 
-        df['Cout_energie_moyen'] = np.where(
-            df['Sous_Categorie'].eq('TH'),
-            (COUT_GAZ_CHAUFFAGE_MIN + COUT_GAZ_CHAUFFAGE_MAX) / 2,
-            COUT_MOYEN_ELECTRICITE_KWH
-        )
-        df['Economies_euros_an'] = df['kWh_reels_annuels'] * df['Cout_energie_moyen']
+        # Logique de coût ultra-simplifiée : on considère que toute économie impacte le chauffage
+        df['Economies_euros_an'] = df['kWh_reels_annuels'] * COUT_CHAUFFAGE_KWH
         df['Prime_versee'] = df['Tableau Recapitulatif champ 23']
 
         return df
@@ -206,52 +220,6 @@ def load_and_process_data(file, taux_efficacite):
     except Exception as e:
         st.error(f"Erreur lors du chargement du fichier : {str(e)}")
         return None
-
-
-def build_pdf(df_view, kpis, hypotheses) -> bytes:
-    buffer = BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=landscape(A4),
-                            rightMargin=24, leftMargin=24, topMargin=24, bottomMargin=24)
-    styles = getSampleStyleSheet()
-    title = Paragraph("Rapport RSE – Activité CEE (vue filtrée)", styles['Title'])
-    elems = [title, Spacer(1, 12)]
-
-    # KPIs
-    kpi_style = ParagraphStyle('kpi', parent=styles['Heading3'], textColor=colors.HexColor("#1e3d59"))
-    for label, value in kpis:
-        elems.append(Paragraph(f"{label} : <b>{value}</b>", kpi_style))
-    elems.append(Spacer(1, 12))
-
-    # Hypothèses
-    elems.append(Paragraph("Hypothèses clés", styles['Heading3']))
-    hypo_tbl = Table([[k, str(v)] for k, v in hypotheses.items()], colWidths=[280, 420])
-    hypo_tbl.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#f1f3f5")),
-        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
-        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-    ]))
-    elems.append(hypo_tbl)
-    elems.append(Spacer(1, 12))
-
-    # Tableau de synthèse
-    cols = ['Code équipement', 'Secteur', 'Sous_Categorie', 'kWh_cumac', 'kWh_reels_annuels',
-            'CO2_evite_tonnes_an', 'Economies_euros_an', 'Statut', 'Type_Beneficiaire', 'Annee_Depot']
-    cols = [c for c in cols if c in df_view.columns]
-    data = [cols] + df_view[cols].head(200).round(2).astype(str).values.tolist()
-    tbl = Table(data, repeatRows=1)
-    tbl.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor("#e9ecef")),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 8),
-        ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.lightgrey]),
-        ('GRID', (0, 0), (-1, -1), 0.25, colors.grey),
-    ]))
-    elems.append(tbl)
-
-    doc.build(elems)
-    buffer.seek(0)
-    return buffer.read()
 
 
 # =========================
@@ -310,10 +278,11 @@ if uploaded_file is not None:
         total_gwh_reels = df_filtered['GWh_reels_annuels'].sum()
         total_foyers = df_filtered['Nb_foyers_equivalents'].sum()
         total_primes = df_filtered['Prime_versee'].sum()
+        total_couts_evites = df_filtered['Economies_euros_an'].sum()
         nb_operations_uniques = df_filtered[
             'Code équipement'].nunique() if 'Code équipement' in df_filtered.columns else 0
 
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             st.metric("📋 Dossiers traités", format_number(total_dossiers), f"Période {', '.join(periode_filter)}")
         with col2:
@@ -326,13 +295,18 @@ if uploaded_file is not None:
             st.metric("💰 Primes versées", f"{format_number(total_primes / 1_000_000, 1)} M€",
                       f"{format_number(total_primes / total_dossiers if total_dossiers > 0 else 0)} €/dossier")
         with col5:
+            st.metric("💸 Coûts évités/an", f"{format_number(total_couts_evites / 1_000_000, 1)} M€", "sur factures")
+        with col6:
             st.metric("🔬 Opérations Uniques", format_number(nb_operations_uniques))
 
         # TABS
         tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
             "🌍 Impact Environnemental", "👥 Impact Social", "🗺️ Impact Géographique",
-            "💼 Impact Économique", "📈 Analyses Détaillées", "📈 Évolution CEE (GWhc)", "📝 Hypothèses", "📄 Rapport PDF"
+            "💼 Impact Économique", "📈 Analyses Détaillées", "📈 Évolution CEE (GWhc)", "📝 Hypothèses",
+            "📈 Projections Futures"
         ])
+
+        # ... (Content of tabs 1 to 7 remains the same)
 
         # ---------- TAB 1 : IMPACT ENVIRONNEMENTAL ----------
         with tab1:
@@ -493,11 +467,64 @@ if uploaded_file is not None:
         # ---------- TAB 4 : ECONOMIQUE ----------
         with tab4:
             st.markdown("### 💰 Valorisation Économique")
+            st.markdown("Analyse des flux financiers : Primes versées et économies générées pour les bénéficiaires.")
+
             if 'Annee_Depot' in df_filtered.columns and not df_filtered['Annee_Depot'].dropna().empty:
-                primes_yearly = df_filtered.groupby('Annee_Depot')['Prime_versee'].sum().reset_index()
-                fig_primes = px.bar(primes_yearly, x='Annee_Depot', y='Prime_versee',
-                                    title="Évolution annuelle des primes versées", color='Prime_versee')
-                st.plotly_chart(fig_primes, use_container_width=True)
+                eco_g = df_filtered.groupby('Annee_Depot').agg(
+                    Primes=('Prime_versee', 'sum'),
+                    Couts_Evites=('Economies_euros_an', 'sum')
+                ).reset_index().sort_values('Annee_Depot')
+
+                # Add cumulative calculations for both metrics
+                eco_g['Primes_Cumul'] = eco_g['Primes'].cumsum()
+                eco_g['Couts_Evites_Cumul'] = eco_g['Couts_Evites'].cumsum()
+
+                # Convert to k€
+                eco_g['Primes_k'] = eco_g['Primes'] / 1000
+                eco_g['Primes_Cumul_k'] = eco_g['Primes_Cumul'] / 1000
+                eco_g['Couts_Evites_k'] = eco_g['Couts_Evites'] / 1000
+                eco_g['Couts_Evites_Cumul_k'] = eco_g['Couts_Evites_Cumul'] / 1000
+
+                # Create a 2x2 grid for the charts
+                col1, col2 = st.columns(2)
+
+                with col1:
+                    # Graph 1: Primes annuelles
+                    fig_primes = px.bar(eco_g, x='Annee_Depot', y='Primes_k',
+                                        title="Primes versées annuelles",
+                                        text=eco_g['Primes_k'].apply(lambda x: f'{x:,.0f}'))
+                    fig_primes.update_layout(yaxis_title="Primes Versées (k€)", xaxis_title="Année", showlegend=False)
+                    fig_primes.update_traces(marker_color=COLOR_PRIME, texttemplate='%{text} k', textposition='outside')
+                    st.plotly_chart(fig_primes, use_container_width=True)
+
+                    # Graph 2: Coûts évités annuels
+                    fig_couts_evites = px.bar(eco_g, x='Annee_Depot', y='Couts_Evites_k',
+                                              title="Coûts évités annuels sur factures",
+                                              text=eco_g['Couts_Evites_k'].apply(lambda x: f'{x:,.0f}'))
+                    fig_couts_evites.update_layout(yaxis_title="Coûts Évités (k€)", xaxis_title="Année",
+                                                   showlegend=False)
+                    fig_couts_evites.update_traces(marker_color=COLOR_ECONOMY, texttemplate='%{text} k',
+                                                   textposition='outside')
+                    st.plotly_chart(fig_couts_evites, use_container_width=True)
+
+                with col2:
+                    # Graph 3: Primes cumulées
+                    fig_primes_cumul = go.Figure(
+                        go.Scatter(x=eco_g['Annee_Depot'], y=eco_g['Primes_Cumul_k'], mode='lines+markers',
+                                   line=dict(color=COLOR_PRIME_ACCENT, width=3),
+                                   name="Primes cumulées (k€)"))
+                    fig_primes_cumul.update_layout(title="Primes versées cumulées", xaxis_title="Année",
+                                                   yaxis_title="Primes Cumulées (k€)", showlegend=False)
+                    st.plotly_chart(fig_primes_cumul, use_container_width=True)
+
+                    # Graph 4: Coûts évités cumulés
+                    fig_couts_cumul = go.Figure(
+                        go.Scatter(x=eco_g['Annee_Depot'], y=eco_g['Couts_Evites_Cumul_k'], mode='lines+markers',
+                                   line=dict(color=COLOR_ECONOMY_ACCENT, width=3),
+                                   name="Coûts évités cumulés (k€)"))
+                    fig_couts_cumul.update_layout(title="Coûts évités cumulés sur factures", xaxis_title="Année",
+                                                  yaxis_title="Coûts Évités Cumulés (k€)", showlegend=False)
+                    st.plotly_chart(fig_couts_cumul, use_container_width=True)
 
         # ---------- TAB 5 : ANALYSES DÉTAILLÉES ----------
         with tab5:
@@ -586,21 +613,104 @@ if uploaded_file is not None:
                     "Arbres équivalents": "Basé sur 25 kgCO2/an/arbre (valeur indicative)."
                 },
                 "Facteurs de Conversion (Cumac -> kWh/an)": {k: round(v, 4) for k, v in FACTEUR_CUMAC_TO_KWH.items()},
+                "Durées de vie des équipements (années)": DUREE_VIE_EQUIPEMENT,
                 "Constantes d'Impact": {
                     "Consommation moyenne d'un foyer (kWh/an)": CONSO_MOYENNE_FOYER_KWH,
                     "Émissions CO2 (kg/kWh)": EMISSION_CO2_KWH,
-                    "Coût de l'électricité (€/kWh)": COUT_MOYEN_ELECTRICITE_KWH
+                    "Coût du chauffage (€/kWh)": COUT_CHAUFFAGE_KWH
                 }
             })
 
-        # ---------- TAB 8 : PDF ----------
+        # ---------- TAB 8 : PROJECTIONS FUTURES ----------
         with tab8:
-            st.markdown("### 📄 Télécharger le Rapport PDF")
-            st.info("Le PDF reprend les filtres, les KPIs et un extrait (200 lignes) de la vue.")
-            st.download_button(label="Télécharger le PDF", data="PDF non disponible dans cette démo",
-                               file_name=f"Rapport_RSE_CEE.pdf", mime="application/pdf")
+            st.markdown("### 📈 Projections Futures des Économies d'Énergie")
+            st.info(
+                "Cette section modélise l'évolution du flux d'économies d'énergie annuelles en tenant compte de la durée de vie des équipements.")
+
+            horizon = st.slider("Horizon de projection (années)", 10, 40, 20)
+
+            if 'Annee_Depot' in df_filtered.columns and not df_filtered.dropna(
+                    subset=['Annee_Depot', 'Duree_Vie']).empty:
+
+                start_year = int(df_filtered['Annee_Depot'].min())
+                current_year = datetime.now().year
+                end_year = current_year + horizon
+
+                projection_years = list(range(start_year, end_year + 1))
+                projection_breakdown_list = []
+
+                # Determine top 5 op types
+                top_ops = df_filtered.groupby('FacteurKey')['GWh_reels_annuels'].sum().nlargest(5).index.tolist()
+
+                df_proj = df_filtered.copy()
+                df_proj['Type Opération'] = df_proj['FacteurKey'].apply(lambda x: x if x in top_ops else 'Autres')
+
+                for year in projection_years:
+                    # An operation is active if the projection year is between its start and end of life
+                    active_ops = df_proj[
+                        (df_proj['Annee_Depot'] <= year) &
+                        (df_proj['Annee_Depot'] + df_proj['Duree_Vie'] > year)
+                        ]
+
+                    # Breakdown by operation type (with 'Autres')
+                    breakdown = active_ops.groupby('Type Opération')['GWh_reels_annuels'].sum()
+                    for op_type, saving in breakdown.items():
+                        projection_breakdown_list.append({
+                            'Année': year,
+                            'Type Opération': op_type,
+                            'Économies GWh/an': saving
+                        })
+
+                # --- Graph 1: Total Projection ---
+                if projection_breakdown_list:
+                    projection_df = pd.DataFrame(projection_breakdown_list)
+                    total_projection_df = projection_df.groupby('Année')['Économies GWh/an'].sum().reset_index()
+
+                    st.markdown("#### Évolution du total des économies annuelles")
+                    fig_projection = px.area(
+                        total_projection_df,
+                        x='Année',
+                        y='Économies GWh/an',
+                        title=f"Projection du flux d'économies sur {horizon} ans",
+                    )
+                    fig_projection.add_vline(x=current_year, line_width=2, line_dash="dash", line_color="red",
+                                             annotation_text="Aujourd'hui")
+                    fig_projection.update_layout(
+                        xaxis_title="Année",
+                        yaxis_title="GWh réels / an",
+                        font=dict(size=14)
+                    )
+                    st.plotly_chart(fig_projection, use_container_width=True)
+
+                    # --- Graph 2: Breakdown Projection ---
+                    st.markdown("#### Composition des économies projetées")
+                    st.info(
+                        "Ce graphique décompose la projection totale pour montrer la contribution des 5 principaux types d'opérations. Les autres sont regroupés pour plus de lisibilité.")
+
+                    fig_projection_breakdown = px.area(
+                        projection_df,
+                        x='Année',
+                        y='Économies GWh/an',
+                        color='Type Opération',
+                        title=f"Composition des économies annuelles projetées",
+                        labels={'Économies GWh/an': 'GWh réels / an'},
+                        # Ensure 'Autres' is at the bottom for clarity
+                        category_orders={"Type Opération": top_ops + ['Autres']}
+                    )
+                    fig_projection_breakdown.add_vline(x=current_year, line_width=2, line_dash="dash",
+                                                       line_color="white", annotation_text="Aujourd'hui")
+                    fig_projection_breakdown.update_layout(
+                        xaxis_title="Année",
+                        yaxis_title="GWh réels / an",
+                        font=dict(size=14)
+                    )
+                    st.plotly_chart(fig_projection_breakdown, use_container_width=True)
+
 
     else:
         st.warning("Le fichier a été chargé mais ne contient aucune ligne exploitable.")
 else:
     st.info("👋 Bienvenue ! Veuillez charger votre fichier de données pour commencer l'analyse.")
+
+
+
